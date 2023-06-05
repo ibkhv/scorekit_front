@@ -2,12 +2,16 @@
 # (A1) LOAD MODULES
 from flask import Flask, render_template
 import pandas as pd
+from vtb_scorekit.data import DataSamples
+from vtb_scorekit.model import LogisticRegressionModel
+from vtb_scorekit.woe import WOE
+#import numpy as np
 
 # (A2) FLASK SETTINGS + INIT
 app = Flask(__name__)
 # app.debug = True
  
-# (B) DEMO - READ CSV & GENERATE HTML TABLE
+# (B) DEMO - READ CSV & GENERATE HTML TABLEpip freeze | grep Jinja2
 
 @app.route('/')
 def index():
@@ -15,7 +19,8 @@ def index():
  
 @app.route('/data',  methods=("POST", "GET"))
 def showData():
-    data = pd.read_csv('demo-data.csv')  
+    data = pd.read_csv('demo-data.csv')   
+
     rows = data.shape[0]
     cols = data.shape[1]-1
     columns = data.columns
@@ -58,7 +63,203 @@ def showData():
 @app.route('/model',  methods=("POST", "GET"))
 def showModel():
 
-    return render_template("model.html")
+    data = pd.read_csv('demo-data.csv')  
+
+    ds = DataSamples(samples={'train': data}, target='default_12m', result_folder='titanic_output', samples_split={}, bootstrap_split={})
+
+    logreg = LogisticRegressionModel(clf=None,        # классификатор модели (должен иметь метод fit() и атрибуты coef_, intercept_). При None выбирается SGDClassifier(alpha=0.001, loss='log', max_iter=100)
+                                 ds=ds,               # Привязанный к модели ДатаСэмпл. Если задан, то он по умолчанию будет использоваться во всех методах
+                                 transformer=None,    # объект класса WOE для предварительной трансформации факторов
+                                 round_digits=3,      # округление коэффициентов до этого кол-ва знаков после запятой   
+                                 name='Titanic',      # название модели
+                                )   
+
+    gini = ds.calc_gini() 
+    gini = gini[(gini['train'] != 0)]
+    f = gini.index
+    gini_html = gini.to_html()
+
+    corr_mat = ds.corr_mat(sample_name=None, features=f, corr_method='pearson', corr_threshold=0.75, description_df=None, styler=False)
+    corr_mat_html = corr_mat.to_html()
+
+
+    logreg.mfa(ds,                                   # ДатаСэмпл. В случае, если он не содержит трансформированные переменные, то выполняется трансформация трансформером self.transformer. При None берется self.ds
+           features=None,                        # исходный список переменных для МФА. При None берутся все переменные, по которым есть активный биннинг
+           hold=None,                            # список переменных, которые обязательно должны войти в модель
+           features_ini=None,                    # список переменных, с которых стартует процедура отбора. Они могут быть исключены в процессе отбора
+           limit_to_add=100,                     # максимальное кол-во переменных, которые могут быть добавлены к модели
+           gini_threshold=5,                     # граница по джини для этапа 1
+           corr_method='pearson',                # метод расчета корреляций для этапа 2. Доступны варианты 'pearson', 'kendall', 'spearman'
+           corr_threshold=0.70,                  # граница по коэффициенту корреляции для этапа 2
+           drop_with_most_correlations=False,    # вариант исключения факторов в корреляционном анализе для этапа 2
+           drop_corr_iteratively=False,          # исключение коррелирующих факторов не на отдельном этапе 2, а итеративно в процессе этапа 3
+                                                 #    (список кандидатов на добавление в модель формируется динамически после каждого шага,
+                                                 #    из него исключаются все коррелирующие с уже включенными факторы).
+                                                 #    Применимо только для типов отбора forward и stepwise
+           selection_type='stepwise',            # тип отбора для этапа 3
+           pvalue_threshold=0.05,                # граница по p-value для этапа 3
+           pvalue_priority=False,                # вариант определения лучшего фактора для этапа 3
+           scoring='gini',                       # максимизируемая метрика для этапа 3
+                                                 #     Варианты значений: 'gini', 'AIC', 'BIC' + все метрики доступные для вычисления через sklearn.model_selection.cross_val_score.
+                                                 #     Все информационные метрики после вычисления умножаются на -1 для сохранения логики максимизации скора.
+           score_delta=0.1,                      # минимальный прирост метрики для этапа 3
+           n_stops=1,                            # количество срабатываний нарушений правил отбора по приросту метрики/p-value до завершения этапа 3
+           cv=None,                              # параметр cv для вычисления скора sklearn.model_selection.cross_val_score для этапа 3. 
+                                                 #     При None берется StratifiedKFold(5, shuffle=True, random_state=self.random_state)
+           drop_positive_coefs=True,             # флаг для выполнения этапа 4
+           
+           # --- Кросс переменные ---
+           crosses_simple=True,                  # True  - после трансформации кросс-переменные учавствут в отборе наравне со всеми переменными
+                                                 # False - сначала выполняется отбор только на основных переменных,
+                                                 #     затем в модель добавляются по тем же правилам кросс переменные, но не более, чем crosses_max_num штук
+           crosses_max_num=10,                   # максимальное кол-во кросс переменных в модели. учитывается только при crosses_simple=False
+           
+           # --- Отчет ---
+           verbose=False,                         # флаг для вывода подробных комментариев в процессе работы
+           result_file='mfa.xlsx',               # файл, в который будут сохраняться результаты мфа
+           metrics=None,                         # список метрик/тестов, результы расчета которых должны быть включены в отчет.
+                                                 #     Элементы списка могут иметь значения (не чувствительно к регистру):
+                                                 #         'ontime': расчет динамики джини по срезам,
+                                                 #         'vif'   : расчет Variance Inflation Factor,
+                                                 #         'psi'   : расчет Population Population Stability Index,
+                                                 #         'wald'  : тест Вальда,
+                                                 #         'ks'    : тест Колмогорова-Смирнова,
+                                                 #         func    : пользовательская функция, которая принимает целевую и зависимую переменную,
+                                                 #                   и возвращает числовое значение метрики
+                                                 #                   Например,
+                                                 #                   def custom_metric(y_true, y_pred):
+                                                 #                       from sklearn.metrics import roc_curve, f1_score
+                                                 #                       fpr, tpr, thresholds = roc_curve(y_true, y_pred)
+                                                 #                       thres = thresholds[np.argmax(tpr * (1 - fpr))]
+                                                 #                       return f1_score(y_true, (y_pred > thres).astype(int))
+                                                 #                   metrics = ['vif', 'ks', 'psi', custom_metric]
+           metrics_cv=None                       # список метрик, рассчитываемых через sklearn.model_selection.cross_val_score.
+                                                 #     Аналогично параметру metrics элементами могут быть строки, поддерживаемые cross_val_score, либо пользовательские функции
+                                                 #     Например, ['roc_auc', 'neg_log_loss', 'gini', 'f1', 'accuracy', custom_metric]
+          )
+
+
+    binning = WOE(ds,                            # ДатаСэмпл, для которого будут рассчитываться биннинги
+              features=None,                     # список переменных. При None берется ds.features
+              scorecard=None,                    # путь к эксель файлу или датафрейм с готовыми биннингами для импорта
+              round_digits=3,                    # округление границ бинов до этого числа знаков после запятой.
+                                                 # При округлении происходит проверка на долю мигрирующих наблюдений. Если округление приедет к миграции большой доли наблюдений,
+                                                 # то round_digits увеличивается до тех пор, пока доля не упадет ниже rounding_migration_coef
+              rounding_migration_coef=0.005,     # максимально допустимая доля наблюдений для миграции между бинами при округлении
+              # ---Параметры для расчета WOE---
+              simple=True,                       # если True, то расчет WOE происходит на трэйн сэмпле, иначе берется среднее значение по фолдам
+              n_folds=5,                         # кол-во фолдов для расчета WOE при simple=False
+              woe_adjust=0.5,                    # корректировочный параметр для расчета EventRate_i в бине i                                                
+              alpha=0,                           # коэффициент регуляризации для расчета WOE
+              alpha_range=None,                  # если alpha=None, то подбирается оптимальное значение alpha из диапазона alpha_range. При None берется диапазон range(10, 100, 10)
+              alpha_scoring='neg_log_loss',      # метрика, используемая для оптимизации alpha
+              alpha_best_criterion='min',        # 'min' - минимизация метрики alpha_scoring, 'max' - максимизация метрики
+              missing_process='max_or_separate', # способ обработки пустых значений:
+                                                 #     'separate' - помещать в отдельный бин
+                                                 #     'min' - объединять с бином с минимальным WOE
+                                                 #     'max' - объединять с бином с максимальным WOE
+                                                 #     'nearest' - объединять с ближайшим по WOE биномом
+                                                 #     'min_or_separate' - если доля пустых значений меньше missing_min_part, то объединять с бином с минимальным WOE, иначе помещать в отдельный бин
+                                                 #     'max_or_separate' - если доля пустых значений меньше missing_min_part, то объединять с бином с максимальным WOE, иначе помещать в отдельный бин
+                                                 #     'nearest_or_separate' - если доля пустых значений меньше missing_min_part, то объединять с ближайшим по WOE бином, иначе помещать в отдельный бин
+              missing_min_part=0.01,             # минимальная доля пустых значений для выделения отдельного бина при missing_process 'min_or_separate', 'max_or_separate' или 'nearest_or_separate'
+              others='missing_or_max',           # Способ обработки значений, не попавших в биннинг:
+                                                 #     'min': остальным значениям присваивается минимальный WOE
+                                                 #     'max': остальным значениям присваивается максимальный WOE
+                                                 #     'missing_or_min': если есть бакет с пустыми значениями, то остальным значениям присваивается его WOE, иначе минимальный WOE
+                                                 #     'missing_or_max': если есть бакет с пустыми значениями, то остальным значениям присваивается его WOE, иначе максимальный WOE
+                                                 #     float: отсутствующим значениям присваивается заданный фиксированный WOE
+              opposite_sign_to_others=True,      # В случае, когда непрерывная переменная на выборке для разработки имеет только один знак,
+                                                 # то все значения с противоположным знаком относить к others
+             )
+
+    binning.auto_fit(features=None,                  # список переменных для обработки. По умолчанию берутся из self.ds.features
+                 autofit_folder='auto_fit',      # название папки, в которую будут сохранены результаты автобиннинга
+                 plot_flag=-1,                 # флаг для вывода графиков с биннингом:
+                                                 #   -1 - графики не строить
+                                                 #    0, False - графики сохранить в папку autofit_folder/Figs_binning, но не выводить в аутпут
+                                                 #    1, True - графики сохранить в папку autofit_folder/Figs_binning и вывести в аутпут
+                 verbose=False,                   # флаг для вывода подробны комментариев в процессе работы
+                 
+                 # --- Метод биннинга ---
+                 method='opt',                   # 'tree' - биннинг деревом, 'opt' - биннинг деревом с последующей оптимизацией границ бинов библиотекой optbinning
+                 max_n_bins=10,                  # максимальное кол-во бинов
+                 min_bin_size=0.05,              # минимальное число (доля) наблюдений в каждом листе дерева.
+                                                 #    Если min_bin_size < 1, то трактуется как доля наблюдений от обучающей выборки
+                 
+                 # --- Параметры биннинга для метода 'tree' ---
+                 criterion='entropy',            # критерий расщепления. Варианты значений: 'entropy', 'gini'
+                 scoring='neg_log_loss',         # метрика для оптимизации
+                 max_depth=5,                    # максимальная глубина дерева
+                 
+                 #--- Параметры биннинга для метода 'opt' ---
+                 solver='cp',                    # солвер для оптимизации биннинга:
+                                                 #   'cp' - constrained programming
+                                                 #   'mip' - mixed-integer programming
+                                                 #   'ls' - LocalSorver (www.localsorver.com)
+                 divergence='iv',                # метрика для максимизации:
+                                                 #   'iv' - Information Value,
+                                                 #   'js' - Jensen-Shannon,
+                                                 #   'hellinger' - Hellinger divergence,
+                                                 #   'triangular' - triangular discrimination
+
+                 # --- Параметры проверок ---
+                 WOEM_on=True,                   # флаг проверки на разницу WOE между соседними группами
+                 WOEM_woe_threshold=0.1,         # если дельта WOE между соседними группами меньше этого значения, то группы объединяются
+                 WOEM_with_missing=False,        # должна ли выполняться проверка для бина с пустыми значениями
+                 SM_on=False,                    # проверка на размер бина
+                 SM_target_threshold=10,         # минимальное кол-во (доля) наблюдений с целевым событием в бине
+                 SM_size_threshold=100,          # минимальное кол-во (доля) наблюдений в бине
+                 BL_on=True,                     # флаг проверки на бизнес-логику
+                 BL_allow_Vlogic_to_increase_gini=10, # разрешить V-образную бизнес-логику, если она приводит к увеличению джини переменной на эту величину относительного монотонного тренда.
+                                                 #        При значении 100 V-образная бизнес-логика запрещена
+                 G_on=True,                      # флаг проверки на джини
+                 G_gini_threshold=5,             # минимальное допустимое джини переменной.
+                                                 #    Проверяется на трэйн сэмпле, + если заданы бутстрэп сэмплы, то проверяется условие mean-1.96*std > G_gini_threshold
+                 G_with_test=True,               # так же проверять джини на остальных доступных сэмплах
+                 G_gini_decrease_threshold=0.5,  # допустимое уменьшение джини на всех сэмплах относительно трэйна.
+                                                 # В случае, если значение >= 1, то проверяется условие gini(train) - gini(sample) <= G_gini_decrease_threshold для основных сэмплов
+                                                 #                                                    и 1.96*std <= G_gini_decrease_threshold для бутсрэп сэмплов
+                                                 # если значение < 1, то проверяется условие 1 - gini(sample)/gini(train) <= G_gini_decrease_threshold для основных сэмплов
+                                                 #                                         и 1.96*std/mean <= G_gini_decrease_threshold для бутсрэп сэмплов
+                 G_gini_increase_restrict=False, # так же ограничение действует и на увеличение джини
+                 WOEO_on=True,                   # флаг проверки на сохранения порядка WOE на бутстрэп-сэмплах
+                 WOEO_dr_threshold=0.01,         # допустимая дельта между TargetRate бинов для прохождения проверки, в случае нарушения порядка
+                 WOEO_correct_threshold=0.90,    # доля бутстрэп-сэмплов, на которых должна проходить проверка
+                 WOEO_miss_is_incorrect=True,    # считать ли отсутствие данных в бине сэмпла ошибкой или нет
+                 WOEO_with_test=False,           # так же проверять тренд на остальных доступных сэмплах
+
+                 # ---Пространство параметров---
+                 params_space=None,              # пространство параметров, с которыми будут выполнены автобиннинги. Задается в виде словаря {параметр: список значений}
+                 woe_best_samples=None,          # список сэмплов, джини которых будет учитываться при выборе лучшего биннинга. По умолчанию берется джини на трэйне
+                 
+                 #--- Кросс переменные ---
+                 cross_features_first_level=None,# список переменных первого уровня для которых будут искаться лучшие кросс пары. При None берется features
+                 cross_num_second_level=0        # кол-во кросс пар, рассматриваемых для каждой переменной первого уровня
+                                                 #   0 - поиск не производится
+                                                 #  -1 - рассматриваются все возможные кросс пары
+                                                 #   n - для каждой переменной первого уровня отбираются n лучших переменных с максимальной метрикой criterion
+                )
+
+    ds = logreg.scoring(ds, score_field='score')
+    gini = ds.calc_gini(features=['score'])
+    gini_train = abs(gini['train'][0] )
+    gini_test = abs(gini['Test'][0] )
+    f_dict=logreg.coefs
+    #feature_html=''
+    features_list=list(f_dict.keys())
+    features_len=len(features_list)
+    features_coefs = {}
+    for key in f_dict:
+        feature_numbers = binning.feature_woes[key].calc_groups_stat()
+        n = feature_numbers['n'].tolist()
+        woe = feature_numbers['woe'].tolist()
+        g = list(map(str, binning.feature_woes[key].groups.values()))
+        f = lambda x: x.replace("[", "Bin ").replace("]", "").replace(", ", " to ")
+        g=list(map(f, g))
+        features_coefs.update({key:{1:n,2:woe,3:g}})
+    
+    return render_template("model.html", gini_html=gini_html,corr_mat_html=corr_mat_html,gini_train=gini_train,gini_test=gini_test,features_list=features_list,features_len=features_len,features_coefs=features_coefs)
 
 
 # (C) START
